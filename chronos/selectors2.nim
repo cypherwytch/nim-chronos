@@ -33,6 +33,10 @@
 
 import stew/results
 import osdefs, osutils, oserrno
+
+when defined(linux) or defined(posix):
+  import posix
+
 export results, oserrno
 
 const
