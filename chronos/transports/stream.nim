@@ -7,10 +7,7 @@
 #  Apache License, version 2.0, (LICENSE-APACHEv2)
 #              MIT license (LICENSE-MIT)
 
-when (NimMajor, NimMinor) < (1, 4):
-  {.push raises: [Defect].}
-else:
-  {.push raises: [].}
+{.push raises: [].}
 
 import std/deques
 import ".."/[asyncloop, handles, osdefs, osutils, oserrno]
@@ -68,7 +65,7 @@ type
 
   ReadMessagePredicate* = proc (data: openArray[byte]): tuple[consumed: int,
                                                               done: bool] {.
-    gcsafe, raises: [Defect].}
+    gcsafe, raises: [].}
 
 const
   StreamTransportTrackerName* = "stream.transport"
@@ -125,14 +122,14 @@ else:
 type
   StreamCallback* = proc(server: StreamServer,
                          client: StreamTransport): Future[void] {.
-                         gcsafe, raises: [Defect].}
+                         gcsafe, raises: [].}
     ## New remote client connection callback
     ## ``server`` - StreamServer object.
     ## ``client`` - accepted client transport.
 
   TransportInitCallback* = proc(server: StreamServer,
                                 fd: AsyncFD): StreamTransport {.
-                                gcsafe, raises: [Defect].}
+                                gcsafe, raises: [].}
     ## Custom transport initialization procedure, which can allocate inherited
     ## StreamTransport object.
 
@@ -144,30 +141,28 @@ type
                                       # transport for new client
 
 proc remoteAddress*(transp: StreamTransport): TransportAddress {.
-    raises: [Defect, TransportError].} =
+    raises: [TransportAbortedError, TransportTooManyError, TransportOsError].} =
   ## Returns ``transp`` remote socket address.
-  if transp.kind != TransportKind.Socket:
-    raise newException(TransportError, "Socket required!")
+  doAssert(transp.kind == TransportKind.Socket, "Socket transport required!")
   if transp.remote.family == AddressFamily.None:
     var saddr: Sockaddr_storage
     var slen = SockLen(sizeof(saddr))
     if getpeername(SocketHandle(transp.fd), cast[ptr SockAddr](addr saddr),
                    addr slen) != 0:
-      raiseTransportOsError(osLastError())
+      raiseTransportError(osLastError())
     fromSAddr(addr saddr, slen, transp.remote)
   transp.remote
 
 proc localAddress*(transp: StreamTransport): TransportAddress {.
-    raises: [Defect, TransportError].} =
+    raises: [TransportAbortedError, TransportTooManyError, TransportOsError].} =
   ## Returns ``transp`` local socket address.
-  if transp.kind != TransportKind.Socket:
-    raise newException(TransportError, "Socket required!")
+  doAssert(transp.kind == TransportKind.Socket, "Socket transport required!")
   if transp.local.family == AddressFamily.None:
     var saddr: Sockaddr_storage
     var slen = SockLen(sizeof(saddr))
     if getsockname(SocketHandle(transp.fd), cast[ptr SockAddr](addr saddr),
                    addr slen) != 0:
-      raiseTransportOsError(osLastError())
+      raiseTransportError(osLastError())
     fromSAddr(addr saddr, slen, transp.local)
   transp.local
 
@@ -205,9 +200,9 @@ template shiftVectorFile(v: var StreamVector, o: untyped) =
   (v).offset += uint(o)
 
 proc setupStreamTransportTracker(): StreamTransportTracker {.
-     gcsafe, raises: [Defect].}
+     gcsafe, raises: [].}
 proc setupStreamServerTracker(): StreamServerTracker {.
-     gcsafe, raises: [Defect].}
+     gcsafe, raises: [].}
 
 proc getStreamTransportTracker(): StreamTransportTracker {.inline.} =
   var res = cast[StreamTransportTracker](getTracker(StreamTransportTrackerName))
@@ -824,9 +819,9 @@ when defined(windows):
       # For some reason Nim compiler does not detect `pipeHandle` usage in
       # pipeContinuation() procedure, so we marking it as {.used.} here.
       var pipeHandle {.used.} = INVALID_HANDLE_VALUE
-      var pipeContinuation: proc (udata: pointer) {.gcsafe, raises: [Defect].}
+      var pipeContinuation: proc (udata: pointer) {.gcsafe, raises: [].}
 
-      pipeContinuation = proc (udata: pointer) {.gcsafe, raises: [Defect].} =
+      pipeContinuation = proc (udata: pointer) {.gcsafe, raises: [].} =
         # Continue only if `retFuture` is not cancelled.
         if not(retFuture.finished()):
           let
@@ -1830,12 +1825,12 @@ proc stop2*(server: StreamServer): Result[void, OSErrorCode] =
     server.status = ServerStatus.Stopped
   ok()
 
-proc start*(server: StreamServer) {.raises: [Defect, TransportOsError].} =
+proc start*(server: StreamServer) {.raises: [TransportOsError].} =
   ## Starts ``server``.
   let res = start2(server)
   if res.isErr(): raiseTransportOsError(res.error())
 
-proc stop*(server: StreamServer) {.raises: [Defect, TransportOsError].} =
+proc stop*(server: StreamServer) {.raises: [TransportOsError].} =
   ## Stops ``server``.
   let res = stop2(server)
   if res.isErr(): raiseTransportOsError(res.error())
@@ -1896,7 +1891,7 @@ proc close*(server: StreamServer) =
 proc closeWait*(server: StreamServer): Future[void] =
   ## Close server ``server`` and release all resources.
   server.close()
-  result = server.join()
+  server.join()
 
 proc createStreamServer*(host: TransportAddress,
                          cbproc: StreamCallback,
@@ -1907,7 +1902,7 @@ proc createStreamServer*(host: TransportAddress,
                          child: StreamServer = nil,
                          init: TransportInitCallback = nil,
                          udata: pointer = nil): StreamServer {.
-    raises: [Defect, TransportOsError].} =
+    raises: [TransportOsError].} =
   ## Create new TCP stream server.
   ##
   ## ``host`` - address to which server will be bound.
@@ -2055,7 +2050,7 @@ proc createStreamServer*(host: TransportAddress,
                    addr slen) != 0:
       let err = osLastError()
       if sock == asyncInvalidSocket:
-        serverSocket.closeSocket()
+        discard unregisterAndCloseFd(serverSocket)
       raiseTransportOsError(err)
     fromSAddr(addr saddr, slen, localAddress)
 
@@ -2115,7 +2110,7 @@ proc createStreamServer*(host: TransportAddress,
                          child: StreamServer = nil,
                          init: TransportInitCallback = nil,
                          udata: pointer = nil): StreamServer {.
-    raises: [Defect, CatchableError].} =
+    raises: [CatchableError].} =
   createStreamServer(host, nil, flags, sock, backlog, bufferSize,
                      child, init, cast[pointer](udata))
 
@@ -2128,7 +2123,7 @@ proc createStreamServer*[T](host: TransportAddress,
                             bufferSize: int = DefaultStreamBufferSize,
                             child: StreamServer = nil,
                             init: TransportInitCallback = nil): StreamServer {.
-    raises: [Defect, CatchableError].} =
+    raises: [CatchableError].} =
   var fflags = flags + {GCUserData}
   GC_ref(udata)
   createStreamServer(host, cbproc, fflags, sock, backlog, bufferSize,
@@ -2142,7 +2137,7 @@ proc createStreamServer*[T](host: TransportAddress,
                             bufferSize: int = DefaultStreamBufferSize,
                             child: StreamServer = nil,
                             init: TransportInitCallback = nil): StreamServer {.
-    raises: [Defect, CatchableError].} =
+    raises: [CatchableError].} =
   var fflags = flags + {GCUserData}
   GC_ref(udata)
   createStreamServer(host, nil, fflags, sock, backlog, bufferSize,
@@ -2150,7 +2145,7 @@ proc createStreamServer*[T](host: TransportAddress,
 
 proc getUserData*[T](server: StreamServer): T {.inline.} =
   ## Obtain user data stored in ``server`` object.
-  result = cast[T](server.udata)
+  cast[T](server.udata)
 
 template fastWrite(transp: auto, pbytes: var ptr byte, rbytes: var int,
                    nbytes: int) =
@@ -2681,7 +2676,7 @@ proc fromPipe2*(fd: AsyncFD, child: StreamTransport = nil,
 
 proc fromPipe*(fd: AsyncFD, child: StreamTransport = nil,
                bufferSize = DefaultStreamBufferSize): StreamTransport {.
-    raises: [Defect, TransportOsError].} =
+    raises: [TransportOsError].} =
   ## Create new transport object using pipe's file descriptor.
   ##
   ## ``bufferSize`` is size of internal buffer for transport.

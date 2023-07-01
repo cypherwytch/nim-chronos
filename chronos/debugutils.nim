@@ -7,10 +7,7 @@
 #    Apache License, version 2.0, (LICENSE-APACHEv2)
 #                MIT license (LICENSE-MIT)
 
-when (NimMajor, NimMinor) < (1, 4):
-  {.push raises: [Defect].}
-else:
-  {.push raises: [].}
+{.push raises: [].}
 
 import "."/[asyncloop, config]
 export asyncloop
@@ -40,7 +37,7 @@ proc dumpPendingFutures*(filter = AllFutureStates): string =
     for item in pendingFutures():
       if item.state in filter:
         inc(count)
-        let loc = item.location[LocCreateIndex][]
+        let loc = item.location[LocationKind.Create][]
         let procedure = $loc.procedure
         let filename = $loc.file
         let procname = if len(procedure) == 0:

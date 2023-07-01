@@ -8,18 +8,15 @@
 #    Apache License, version 2.0, (LICENSE-APACHEv2)
 #                MIT license (LICENSE-MIT)
 
-when (NimMajor, NimMinor) < (1, 4):
-  {.push raises: [Defect].}
-else:
-  {.push raises: [].}
+{.push raises: [].}
 
 from nativesockets import Port
 import std/[tables, strutils, heapqueue, deques]
 import stew/results
-import "."/[config, osdefs, oserrno, osutils, timer]
+import "."/[config, futures, osdefs, oserrno, osutils, timer]
 
 export Port
-export timer, results
+export futures, timer, results
 
 #{.injectStmt: newGcInvariant().}
 
@@ -158,11 +155,7 @@ elif defined(macosx) or defined(freebsd) or defined(netbsd) or
   export oserrno
 
 type
-  CallbackFunc* = proc (arg: pointer) {.gcsafe, raises: [Defect].}
-
-  AsyncCallback* = object
-    function*: CallbackFunc
-    udata*: pointer
+  AsyncCallback = InternalAsyncCallback
 
   AsyncError* = object of CatchableError
     ## Generic async exception
@@ -175,8 +168,8 @@ type
 
   TrackerBase* = ref object of RootRef
     id*: string
-    dump*: proc(): string {.gcsafe, raises: [Defect].}
-    isLeaked*: proc(): bool {.gcsafe, raises: [Defect].}
+    dump*: proc(): string {.gcsafe, raises: [].}
+    isLeaked*: proc(): bool {.gcsafe, raises: [].}
 
   PDispatcherBase = ref object of RootRef
     timers*: HeapQueue[TimerCallback]
@@ -289,6 +282,9 @@ func toException*(v: OSErrorCode): ref OSError = newOSError(v)
   # Result[T, OSErrorCode] values.
 
 when defined(windows):
+  {.pragma: stdcallbackFunc, stdcall, gcsafe, raises: [].}
+
+  export SIGINT, SIGQUIT, SIGTERM
   type
     CompletionKey = ULONG_PTR
 
@@ -301,11 +297,8 @@ when defined(windows):
     CustomOverlapped* = object of OVERLAPPED
       data*: CompletionData
 
-    OVERLAPPED_ENTRY* = object
-      lpCompletionKey*: ULONG_PTR
-      lpOverlapped*: ptr CustomOverlapped
-      internal: ULONG_PTR
-      dwNumberOfBytesTransferred: DWORD
+    DispatcherFlag* = enum
+      SignalHandlerInstalled
 
     PDispatcher* = ref object of PDispatcherBase
       ioPort: HANDLE
@@ -315,6 +308,7 @@ when defined(windows):
       getAcceptExSockAddrs*: WSAPROC_GETACCEPTEXSOCKADDRS
       transmitFile*: WSAPROC_TRANSMITFILE
       getQueuedCompletionStatusEx*: LPFN_GETQUEUEDCOMPLETIONSTATUSEX
+      flags: set[DispatcherFlag]
 
     PtrCustomOverlapped* = ptr CustomOverlapped
 
@@ -330,6 +324,7 @@ when defined(windows):
 
     WaitableHandle* = ref PostCallbackData
     ProcessHandle* = distinct WaitableHandle
+    SignalHandle* = distinct WaitableHandle
 
     WaitableResult* {.pure.} = enum
       Ok, Timeout
@@ -417,8 +412,8 @@ when defined(windows):
 
   var gDisp{.threadvar.}: PDispatcher ## Global dispatcher
 
-  proc setThreadDispatcher*(disp: PDispatcher) {.gcsafe, raises: [Defect].}
-  proc getThreadDispatcher*(): PDispatcher {.gcsafe, raises: [Defect].}
+  proc setThreadDispatcher*(disp: PDispatcher) {.gcsafe, raises: [].}
+  proc getThreadDispatcher*(): PDispatcher {.gcsafe, raises: [].}
 
   proc getIoHandler*(disp: PDispatcher): HANDLE =
     ## Returns the underlying IO Completion Port handle (Windows) or selector
@@ -434,7 +429,7 @@ when defined(windows):
     loop.handles.incl(fd)
     ok()
 
-  proc register*(fd: AsyncFD) {.raises: [Defect, OSError].} =
+  proc register*(fd: AsyncFD) {.raises: [OSError].} =
     ## Register file descriptor ``fd`` in thread's dispatcher.
     register2(fd).tryGet()
 
@@ -444,7 +439,7 @@ when defined(windows):
 
   {.push stackTrace: off.}
   proc waitableCallback(param: pointer, timerOrWaitFired: WINBOOL) {.
-       stdcall, gcsafe.} =
+       stdcallbackFunc.} =
     # This procedure will be executed in `wait thread`, so it must not use
     # GC related objects.
     # We going to ignore callbacks which was spawned when `isNil(param) == true`
@@ -566,16 +561,96 @@ when defined(windows):
 
   proc addProcess*(pid: int, cb: CallbackFunc,
                    udata: pointer = nil): ProcessHandle {.
-       raises: [Defect, OSError].} =
+       raises: [OSError].} =
     ## Registers callback ``cb`` to be called when process with process
     ## identifier ``pid`` exited. Returns process identifier, which can be
     ## used to clear process callback via ``removeProcess``.
     addProcess2(pid, cb, udata).tryGet()
 
   proc removeProcess*(procHandle: ProcessHandle) {.
-       raises: [Defect, OSError].} =
+       raises: [ OSError].} =
     ## Remove process' watching using process' descriptor ``procHandle``.
     removeProcess2(procHandle).tryGet()
+
+  {.push stackTrace: off.}
+  proc consoleCtrlEventHandler(dwCtrlType: DWORD): uint32 {.stdcallbackFunc.} =
+    ## This procedure will be executed in different thread, so it MUST not use
+    ## any GC related features (strings, seqs, echo etc.).
+    case dwCtrlType
+    of CTRL_C_EVENT:
+      return
+        (if raiseSignal(SIGINT).valueOr(false): TRUE else: FALSE)
+    of CTRL_BREAK_EVENT:
+      return
+        (if raiseSignal(SIGINT).valueOr(false): TRUE else: FALSE)
+    of CTRL_CLOSE_EVENT:
+      return
+        (if raiseSignal(SIGTERM).valueOr(false): TRUE else: FALSE)
+    of CTRL_LOGOFF_EVENT:
+      return
+        (if raiseSignal(SIGQUIT).valueOr(false): TRUE else: FALSE)
+    else:
+      FALSE
+  {.pop.}
+
+  proc addSignal2*(signal: int, cb: CallbackFunc,
+                   udata: pointer = nil): Result[SignalHandle, OSErrorCode] =
+    ## Start watching signal ``signal``, and when signal appears, call the
+    ## callback ``cb`` with specified argument ``udata``. Returns signal
+    ## identifier code, which can be used to remove signal callback
+    ## via ``removeSignal``.
+    ##
+    ## NOTE: On Windows only subset of signals are supported: SIGINT, SIGTERM,
+    ##       SIGQUIT
+    const supportedSignals = [SIGINT, SIGTERM, SIGQUIT]
+    doAssert(cint(signal) in supportedSignals, "Signal is not supported")
+    let loop = getThreadDispatcher()
+    var hWait: WaitableHandle = nil
+
+    proc continuation(ucdata: pointer) {.gcsafe.} =
+      doAssert(not(isNil(ucdata)))
+      doAssert(not(isNil(hWait)))
+      cb(hWait[].udata)
+
+    if SignalHandlerInstalled notin loop.flags:
+      if getConsoleCP() != 0'u32:
+        # Console application, we going to cleanup Nim default signal handlers.
+        if setConsoleCtrlHandler(consoleCtrlEventHandler, TRUE) == FALSE:
+          return err(osLastError())
+        loop.flags.incl(SignalHandlerInstalled)
+      else:
+        return err(ERROR_NOT_SUPPORTED)
+
+    let
+      flags = WT_EXECUTEINWAITTHREAD
+      hEvent = ? openEvent($getSignalName(signal))
+
+    hWait = registerWaitable(hEvent, flags, InfiniteDuration,
+                             continuation, udata).valueOr:
+      discard closeFd(hEvent)
+      return err(error)
+    ok(SignalHandle(hWait))
+
+  proc removeSignal2*(signalHandle: SignalHandle): Result[void, OSErrorCode] =
+    ## Remove watching signal ``signal``.
+    ? closeWaitable(WaitableHandle(signalHandle))
+    ok()
+
+  proc addSignal*(signal: int, cb: CallbackFunc,
+                  udata: pointer = nil): SignalHandle {.
+       raises: [ValueError].} =
+    ## Registers callback ``cb`` to be called when signal ``signal`` will be
+    ## raised. Returns signal identifier, which can be used to clear signal
+    ## callback via ``removeSignal``.
+    addSignal2(signal, cb, udata).valueOr:
+      raise newException(ValueError, osErrorMsg(error))
+
+  proc removeSignal*(signalHandle: SignalHandle) {.
+       raises: [ValueError].} =
+    ## Remove signal's watching using signal descriptor ``signalfd``.
+    let res = removeSignal2(signalHandle)
+    if res.isErr():
+      raise newException(ValueError, osErrorMsg(res.error()))
 
   proc poll*() =
     ## Perform single asynchronous step, processing timers and completing
@@ -747,8 +822,8 @@ elif defined(macosx) or defined(freebsd) or defined(netbsd) or
 
   var gDisp{.threadvar.}: PDispatcher ## Global dispatcher
 
-  proc setThreadDispatcher*(disp: PDispatcher) {.gcsafe, raises: [Defect].}
-  proc getThreadDispatcher*(): PDispatcher {.gcsafe, raises: [Defect].}
+  proc setThreadDispatcher*(disp: PDispatcher) {.gcsafe, raises: [].}
+  proc getThreadDispatcher*(): PDispatcher {.gcsafe, raises: [].}
 
   proc getIoHandler*(disp: PDispatcher): Selector[SelectorData] =
     ## Returns system specific OS queue.
@@ -823,31 +898,31 @@ elif defined(macosx) or defined(freebsd) or defined(netbsd) or
       return err(osdefs.EBADF)
     loop.selector.updateHandle2(cint(fd), newEvents)
 
-  proc register*(fd: AsyncFD) {.raises: [Defect, OSError].} =
+  proc register*(fd: AsyncFD) {.raises: [OSError].} =
     ## Register file descriptor ``fd`` in thread's dispatcher.
     register2(fd).tryGet()
 
-  proc unregister*(fd: AsyncFD) {.raises: [Defect, OSError].} =
+  proc unregister*(fd: AsyncFD) {.raises: [OSError].} =
     ## Unregister file descriptor ``fd`` from thread's dispatcher.
     unregister2(fd).tryGet()
 
   proc addReader*(fd: AsyncFD, cb: CallbackFunc, udata: pointer = nil) {.
-       raises: [Defect, OSError].} =
+       raises: [OSError].} =
     ## Start watching the file descriptor ``fd`` for read availability and then
     ## call the callback ``cb`` with specified argument ``udata``.
     addReader2(fd, cb, udata).tryGet()
 
-  proc removeReader*(fd: AsyncFD) {.raises: [Defect, OSError].} =
+  proc removeReader*(fd: AsyncFD) {.raises: [OSError].} =
     ## Stop watching the file descriptor ``fd`` for read availability.
     removeReader2(fd).tryGet()
 
   proc addWriter*(fd: AsyncFD, cb: CallbackFunc, udata: pointer = nil) {.
-       raises: [Defect, OSError].} =
+       raises: [OSError].} =
     ## Start watching the file descriptor ``fd`` for write availability and then
     ## call the callback ``cb`` with specified argument ``udata``.
     addWriter2(fd, cb, udata).tryGet()
 
-  proc removeWriter*(fd: AsyncFD) {.raises: [Defect, OSError].} =
+  proc removeWriter*(fd: AsyncFD) {.raises: [OSError].} =
     ## Stop watching the file descriptor ``fd`` for write availability.
     removeWriter2(fd).tryGet()
 
@@ -870,7 +945,6 @@ elif defined(macosx) or defined(freebsd) or defined(netbsd) or
     ## Please note, that socket is not closed immediately. To avoid bugs with
     ## closing socket, while operation pending, socket will be closed as
     ## soon as all pending operations will be notified.
-    ## You can execute ``aftercb`` before actual socket close operation.
     let loop = getThreadDispatcher()
 
     proc continuation(udata: pointer) =
@@ -970,7 +1044,7 @@ elif defined(macosx) or defined(freebsd) or defined(netbsd) or
 
     proc addSignal*(signal: int, cb: CallbackFunc,
                     udata: pointer = nil): SignalHandle {.
-         raises: [Defect, OSError].} =
+         raises: [OSError].} =
       ## Start watching signal ``signal``, and when signal appears, call the
       ## callback ``cb`` with specified argument ``udata``. Returns signal
       ## identifier code, which can be used to remove signal callback
@@ -978,20 +1052,20 @@ elif defined(macosx) or defined(freebsd) or defined(netbsd) or
       addSignal2(signal, cb, udata).tryGet()
 
     proc removeSignal*(signalHandle: SignalHandle) {.
-         raises: [Defect, OSError].} =
+         raises: [OSError].} =
       ## Remove watching signal ``signal``.
       removeSignal2(signalHandle).tryGet()
 
     proc addProcess*(pid: int, cb: CallbackFunc,
                      udata: pointer = nil): ProcessHandle {.
-         raises: [Defect, OSError].} =
+         raises: [OSError].} =
       ## Registers callback ``cb`` to be called when process with process
       ## identifier ``pid`` exited. Returns process identifier, which can be
       ## used to clear process callback via ``removeProcess``.
       addProcess2(pid, cb, udata).tryGet()
 
     proc removeProcess*(procHandle: ProcessHandle) {.
-         raises: [Defect, OSError].} =
+         raises: [OSError].} =
       ## Remove process' watching using process' descriptor ``procHandle``.
       removeProcess2(procHandle).tryGet()
 
@@ -1168,41 +1242,44 @@ proc callIdle*(cbproc: CallbackFunc) =
 
 include asyncfutures2
 
-when not(defined(windows)):
-  when asyncEventEngine in ["epoll", "kqueue"]:
-    proc waitSignal*(signal: int): Future[void] {.raises: [Defect].} =
-      var retFuture = newFuture[void]("chronos.waitSignal()")
-      var signalHandle: Opt[SignalHandle]
 
-      template getSignalException(e: OSErrorCode): untyped =
-        newException(AsyncError, "Could not manipulate signal handler, " &
-                     "reason [" & $int(e) & "]: " & osErrorMsg(e))
+when defined(macosx) or defined(macos) or defined(freebsd) or
+     defined(netbsd) or defined(openbsd) or defined(dragonfly) or
+     defined(linux) or defined(windows):
 
-      proc continuation(udata: pointer) {.gcsafe.} =
-        if not(retFuture.finished()):
-          if signalHandle.isSome():
-            let res = removeSignal2(signalHandle.get())
-            if res.isErr():
-              retFuture.fail(getSignalException(res.error()))
-            else:
-              retFuture.complete()
+  proc waitSignal*(signal: int): Future[void] {.raises: [].} =
+    var retFuture = newFuture[void]("chronos.waitSignal()")
+    var signalHandle: Opt[SignalHandle]
 
-      proc cancellation(udata: pointer) {.gcsafe.} =
-        if not(retFuture.finished()):
-          if signalHandle.isSome():
-            let res = removeSignal2(signalHandle.get())
-            if res.isErr():
-              retFuture.fail(getSignalException(res.error()))
+    template getSignalException(e: OSErrorCode): untyped =
+      newException(AsyncError, "Could not manipulate signal handler, " &
+                   "reason [" & $int(e) & "]: " & osErrorMsg(e))
 
-      signalHandle =
-        block:
-          let res = addSignal2(signal, continuation)
+    proc continuation(udata: pointer) {.gcsafe.} =
+      if not(retFuture.finished()):
+        if signalHandle.isSome():
+          let res = removeSignal2(signalHandle.get())
           if res.isErr():
             retFuture.fail(getSignalException(res.error()))
-          Opt.some(res.get())
+          else:
+            retFuture.complete()
 
-      retFuture.cancelCallback = cancellation
-      retFuture
+    proc cancellation(udata: pointer) {.gcsafe.} =
+      if not(retFuture.finished()):
+        if signalHandle.isSome():
+          let res = removeSignal2(signalHandle.get())
+          if res.isErr():
+            retFuture.fail(getSignalException(res.error()))
+
+    signalHandle =
+      block:
+        let res = addSignal2(signal, continuation)
+        if res.isErr():
+          retFuture.fail(getSignalException(res.error()))
+        Opt.some(res.get())
+
+    retFuture.cancelCallback = cancellation
+    retFuture
 
 proc sleepAsync*(duration: Duration): Future[void] =
   ## Suspends the execution of the current async procedure for the next
@@ -1240,8 +1317,8 @@ proc stepsAsync*(number: int): Future[void] =
   var retFuture = newFuture[void]("chronos.stepsAsync(int)")
   var counter = 0
 
-  var continuation: proc(data: pointer) {.gcsafe, raises: [Defect].}
-  continuation = proc(data: pointer) {.gcsafe, raises: [Defect].} =
+  var continuation: proc(data: pointer) {.gcsafe, raises: [].}
+  continuation = proc(data: pointer) {.gcsafe, raises: [].} =
     if not(retFuture.finished()):
       inc(counter)
       if counter < number:
@@ -1292,7 +1369,7 @@ proc withTimeout*[T](fut: Future[T], timeout: Duration): Future[bool] =
 
   # TODO: raises annotation shouldn't be needed, but likely similar issue as
   # https://github.com/nim-lang/Nim/issues/17369
-  proc continuation(udata: pointer) {.gcsafe, raises: [Defect].} =
+  proc continuation(udata: pointer) {.gcsafe, raises: [].} =
     if not(retFuture.finished()):
       if not(cancelling):
         if not(fut.finished()):
@@ -1310,7 +1387,7 @@ proc withTimeout*[T](fut: Future[T], timeout: Duration): Future[bool] =
 
   # TODO: raises annotation shouldn't be needed, but likely similar issue as
   # https://github.com/nim-lang/Nim/issues/17369
-  proc cancellation(udata: pointer) {.gcsafe, raises: [Defect].} =
+  proc cancellation(udata: pointer) {.gcsafe, raises: [].} =
     if not isNil(timer):
       clearTimer(timer)
     if not(fut.finished()):
@@ -1351,7 +1428,7 @@ proc wait*[T](fut: Future[T], timeout = InfiniteDuration): Future[T] =
   var timer: TimerCallback
   var cancelling = false
 
-  proc continuation(udata: pointer) {.raises: [Defect].} =
+  proc continuation(udata: pointer) {.raises: [].} =
     if not(retFuture.finished()):
       if not(cancelling):
         if not(fut.finished()):
@@ -1373,8 +1450,8 @@ proc wait*[T](fut: Future[T], timeout = InfiniteDuration): Future[T] =
       else:
         retFuture.fail(newException(AsyncTimeoutError, "Timeout exceeded!"))
 
-  var cancellation: proc(udata: pointer) {.gcsafe, raises: [Defect].}
-  cancellation = proc(udata: pointer) {.gcsafe, raises: [Defect].} =
+  var cancellation: proc(udata: pointer) {.gcsafe, raises: [].}
+  cancellation = proc(udata: pointer) {.gcsafe, raises: [].} =
     if not isNil(timer):
       clearTimer(timer)
     if not(fut.finished()):
@@ -1414,13 +1491,13 @@ proc wait*[T](fut: Future[T], timeout = -1): Future[T] {.
 
 include asyncmacro2
 
-proc runForever*() {.raises: [Defect, CatchableError].} =
+proc runForever*() =
   ## Begins a never ending global dispatcher poll loop.
   ## Raises different exceptions depending on the platform.
   while true:
     poll()
 
-proc waitFor*[T](fut: Future[T]): T {.raises: [Defect, CatchableError].} =
+proc waitFor*[T](fut: Future[T]): T {.raises: [CatchableError].} =
   ## **Blocks** the current thread until the specified future completes.
   ## There's no way to tell if poll or read raised the exception
   while not(fut.finished()):
@@ -1456,7 +1533,7 @@ when chronosFutureTracking:
 when defined(windows):
   proc waitForSingleObject*(handle: HANDLE,
                             timeout: Duration): Future[WaitableResult] {.
-       raises: [Defect].} =
+       raises: [].} =
     ## Waits until the specified object is in the signaled state or the
     ## time-out interval elapses. WaitForSingleObject() for asynchronous world.
     let flags = WT_EXECUTEONLYONCE

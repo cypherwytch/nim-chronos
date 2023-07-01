@@ -9,46 +9,73 @@
 
 import std/[macros]
 
-proc skipUntilStmtList(node: NimNode): NimNode {.compileTime.} =
-  # Skips a nest of StmtList's.
-  if node[0].kind == nnkStmtList:
-    skipUntilStmtList(node[0])
+# `quote do` will ruin line numbers so we avoid it using these helpers
+proc completeWithResult(fut, baseType: NimNode): NimNode {.compileTime.} =
+  # when `baseType` is void:
+  #   complete(`fut`)
+  # else:
+  #   complete(`fut`, result)
+  if baseType.eqIdent("void"):
+    # Shortcut if we know baseType at macro expansion time
+    newCall(ident "complete", fut)
   else:
-    node
+    # `baseType` might be generic and resolve to `void`
+    nnkWhenStmt.newTree(
+      nnkElifExpr.newTree(
+        nnkInfix.newTree(ident "is", baseType, ident "void"),
+        newCall(ident "complete", fut)
+      ),
+      nnkElseExpr.newTree(
+        newCall(ident "complete", fut, ident "result")
+      )
+    )
 
-proc processBody(node, retFutureSym: NimNode,
-                 baseTypeIsVoid: bool): NimNode {.compileTime.} =
+proc completeWithNode(fut, baseType, node: NimNode): NimNode {.compileTime.} =
+  #   when typeof(`node`) is void:
+  #     `node` # statement / explicit return
+  #     -> completeWithResult(fut, baseType)
+  #   else: # expression / implicit return
+  #     complete(`fut`, `node`)
+  if node.kind == nnkEmpty: # shortcut when known at macro expanstion time
+    completeWithResult(fut, baseType)
+  else:
+    # Handle both expressions and statements - since the type is not know at
+    # macro expansion time, we delegate this choice to a later compilation stage
+    # with `when`.
+    nnkWhenStmt.newTree(
+      nnkElifExpr.newTree(
+        nnkInfix.newTree(
+          ident "is", nnkTypeOfExpr.newTree(node), ident "void"),
+        newStmtList(
+          node,
+          completeWithResult(fut, baseType)
+        )
+      ),
+      nnkElseExpr.newTree(
+        newCall(ident "complete", fut, node)
+      )
+    )
+
+proc processBody(node, fut, baseType: NimNode): NimNode {.compileTime.} =
   #echo(node.treeRepr)
-  result = node
   case node.kind
   of nnkReturnStmt:
-    result = newNimNode(nnkStmtList, node)
+    let
+      res = newNimNode(nnkStmtList, node)
+    res.add completeWithNode(fut, baseType, processBody(node[0], fut, baseType))
+    res.add newNimNode(nnkReturnStmt, node).add(newNilLit())
 
-    # As I've painfully found out, the order here really DOES matter.
-    if node[0].kind == nnkEmpty:
-      if not baseTypeIsVoid:
-        result.add newCall(newIdentNode("complete"), retFutureSym,
-            newIdentNode("result"))
-      else:
-        result.add newCall(newIdentNode("complete"), retFutureSym)
-    else:
-      let x = node[0].processBody(retFutureSym, baseTypeIsVoid)
-      if x.kind == nnkYieldStmt: result.add x
-      else:
-        result.add newCall(newIdentNode("complete"), retFutureSym, x)
-
-    result.add newNimNode(nnkReturnStmt, node).add(newNilLit())
-    return # Don't process the children of this return stmt
+    res
   of RoutineNodes-{nnkTemplateDef}:
     # skip all the nested procedure definitions
-    return node
-  else: discard
-
-  for i in 0 ..< result.len:
-    # We must not transform nested procedures of any form, otherwise
-    # `retFutureSym` will be used for all nested procedures as their own
-    # `retFuture`.
-    result[i] = processBody(result[i], retFutureSym, baseTypeIsVoid)
+    node
+  else:
+    for i in 0 ..< node.len:
+      # We must not transform nested procedures of any form, otherwise
+      # `fut` will be used for all nested procedures as their own
+      # `retFuture`.
+      node[i] = processBody(node[i], fut, baseType)
+    node
 
 proc getName(node: NimNode): string {.compileTime.} =
   case node.kind
@@ -62,10 +89,6 @@ proc getName(node: NimNode): string {.compileTime.} =
     return "anonymous"
   else:
     error("Unknown name.")
-
-proc verifyReturnType(typeName: string) {.compileTime.} =
-  if typeName != "Future":
-    error("Expected return type of 'Future' got '" & typeName & "'")
 
 macro unsupported(s: static[string]): untyped =
   error s
@@ -95,22 +118,25 @@ proc asyncSingleProc(prc: NimNode): NimNode {.compileTime.} =
   ## The ``async`` macro supports a stmtList holding multiple async procedures.
   if prc.kind notin {nnkProcTy, nnkProcDef, nnkLambda, nnkMethodDef, nnkDo}:
       error("Cannot transform " & $prc.kind & " into an async proc." &
-            " proc/method definition or lambda node expected.")
+            " proc/method definition or lambda node expected.", prc)
 
   let returnType = cleanupOpenSymChoice(prc.params2[0])
 
   # Verify that the return type is a Future[T]
   let baseType =
-    if returnType.kind == nnkBracketExpr:
-      let fut = repr(returnType[0])
-      verifyReturnType(fut)
-      returnType[1]
-    elif returnType.kind == nnkEmpty:
-      ident("void")
+    if returnType.kind == nnkEmpty:
+      ident "void"
+    elif not (
+        returnType.kind == nnkBracketExpr and eqIdent(returnType[0], "Future")):
+      error(
+        "Expected return type of 'Future' got '" & repr(returnType) & "'", prc)
+      return
     else:
-      raiseAssert("Unhandled async return type: " & $prc.kind)
+      returnType[1]
 
-  let baseTypeIsVoid = baseType.eqIdent("void")
+  let
+    baseTypeIsVoid = baseType.eqIdent("void")
+    futureVoidType = nnkBracketExpr.newTree(ident "Future", ident "void")
 
   if prc.kind in {nnkProcDef, nnkLambda, nnkMethodDef, nnkDo}:
     let
@@ -123,73 +149,58 @@ proc asyncSingleProc(prc: NimNode): NimNode {.compileTime.} =
 
     let
       internalFutureSym = ident "chronosInternalRetFuture"
-      procBody = prc.body.processBody(internalFutureSym, baseTypeIsVoid)
+      internalFutureType =
+        if baseTypeIsVoid: futureVoidType
+        else: returnType
+      castFutureSym = nnkCast.newTree(internalFutureType, internalFutureSym)
+
+      procBody = prc.body.processBody(castFutureSym, baseType)
 
     # don't do anything with forward bodies (empty)
     if procBody.kind != nnkEmpty:
-      # fix #13899, `defer` should not escape its original scope
-      let procBodyBlck =
-        newStmtList(newTree(nnkBlockStmt, newEmptyNode(), procBody))
-
-      # Avoid too much quote do to not lose original line numbers
-      let closureBody = if baseTypeIsVoid:
-        let resultTemplate = quote do:
-          template result: auto {.used.} =
-            {.fatal: "You should not reference the `result` variable inside" &
-                    " a void async proc".}
-        # -> complete(chronosInternalRetFuture)
-        let complete =
-          newCall(newIdentNode("complete"), internalFutureSym)
-
-        newStmtList(resultTemplate, procBodyBlck, complete)
-      else:
-        # -> iterator nameIter(chronosInternalRetFuture: Future[T]): FutureBase {.closure.} =
-        # ->   {.push warning[resultshadowed]: off.}
-        # ->   var result: T
-        # ->   {.pop.}
-        # ->   <proc_body>
-        # ->   complete(chronosInternalRetFuture, result)
-        newStmtList(
-           # -> {.push warning[resultshadowed]: off.}
-          newNimNode(nnkPragma).add(newIdentNode("push"),
-            newNimNode(nnkExprColonExpr).add(newNimNode(nnkBracketExpr).add(
-              newIdentNode("warning"), newIdentNode("resultshadowed")),
-            newIdentNode("off"))),
-
-          # -> var result: T
-          newNimNode(nnkVarSection, prc.body).add(
-            newIdentDefs(newIdentNode("result"), baseType)),
-
-          # -> {.pop.})
-          newNimNode(nnkPragma).add(
-            newIdentNode("pop")),
-
-          procBodyBlck,
-
-          # -> complete(chronosInternalRetFuture, result)
-          newCall(newIdentNode("complete"),
-            internalFutureSym, newIdentNode("result")))
-
       let
-        internalFutureType =
-          if baseTypeIsVoid:
-            newNimNode(nnkBracketExpr, prc).add(newIdentNode("Future")).add(newIdentNode("void"))
-          else: returnType
-        internalFutureParameter = nnkIdentDefs.newTree(internalFutureSym, internalFutureType, newEmptyNode())
+        # fix #13899, `defer` should not escape its original scope
+        procBodyBlck = nnkBlockStmt.newTree(newEmptyNode(), procBody)
+
+        resultDecl = nnkWhenStmt.newTree(
+          # when `baseType` is void:
+          nnkElifExpr.newTree(
+            nnkInfix.newTree(ident "is", baseType, ident "void"),
+            quote do:
+              template result: auto {.used.} =
+                {.fatal: "You should not reference the `result` variable inside" &
+                        " a void async proc".}
+          ),
+          # else:
+          nnkElseExpr.newTree(
+            newStmtList(
+              quote do: {.push warning[resultshadowed]: off.},
+              # var result: `baseType`
+              nnkVarSection.newTree(
+                nnkIdentDefs.newTree(ident "result", baseType, newEmptyNode())),
+              quote do: {.pop.},
+            )
+          )
+        )
+
+        completeDecl = completeWithNode(castFutureSym, baseType, procBodyBlck)
+
+        closureBody = newStmtList(resultDecl, completeDecl)
+
+        internalFutureParameter = nnkIdentDefs.newTree(
+          internalFutureSym, newIdentNode("FutureBase"), newEmptyNode())
         iteratorNameSym = genSym(nskIterator, $prcName)
-        closureIterator = newProc(iteratorNameSym, [newIdentNode("FutureBase"), internalFutureParameter],
-                                  closureBody, nnkIteratorDef)
+        closureIterator = newProc(
+          iteratorNameSym,
+          [newIdentNode("FutureBase"), internalFutureParameter],
+          closureBody, nnkIteratorDef)
+
+      iteratorNameSym.copyLineInfo(prc)
 
       closureIterator.pragma = newNimNode(nnkPragma, lineInfoFrom=prc.body)
       closureIterator.addPragma(newIdentNode("closure"))
-      # **Remark 435**: We generate a proc with an inner iterator which call each other
-      # recursively. The current Nim compiler is not smart enough to infer
-      # the `gcsafe`-ty aspect of this setup, so we always annotate it explicitly
-      # with `gcsafe`. This means that the client code is always enforced to be
-      # `gcsafe`. This is still **safe**, the compiler still checks for `gcsafe`-ty
-      # regardless, it is only helping the compiler's inference algorithm. See
-      # https://github.com/nim-lang/RFCs/issues/435
-      # for more details.
+
+      # `async` code must be gcsafe
       closureIterator.addPragma(newIdentNode("gcsafe"))
 
       # TODO when push raises is active in a module, the iterator here inherits
@@ -200,8 +211,6 @@ proc asyncSingleProc(prc: NimNode): NimNode {.compileTime.} =
       let raises = nnkBracket.newTree()
       when chronosStrictException:
         raises.add(newIdentNode("CatchableError"))
-        when (NimMajor, NimMinor) < (1, 4):
-          raises.add(newIdentNode("Defect"))
       else:
         raises.add(newIdentNode("Exception"))
 
@@ -211,9 +220,11 @@ proc asyncSingleProc(prc: NimNode): NimNode {.compileTime.} =
       ))
 
       # If proc has an explicit gcsafe pragma, we add it to iterator as well.
+      # TODO if these lines are not here, srcloc tests fail (!)
       if prc.pragma.findChild(it.kind in {nnkSym, nnkIdent} and
                               it.strVal == "gcsafe") != nil:
         closureIterator.addPragma(newIdentNode("gcsafe"))
+
       outerProcBody.add(closureIterator)
 
       # -> let resultFuture = newFuture[T]()
@@ -221,6 +232,7 @@ proc asyncSingleProc(prc: NimNode): NimNode {.compileTime.} =
       # doesn't reference it, avoid cyclic ref (#203)
       let
         retFutureSym = ident "resultFuture"
+      retFutureSym.copyLineInfo(prc)
       # Do not change this code to `quote do` version because `instantiationInfo`
       # will be broken for `newFuture()` call.
       outerProcBody.add(
@@ -230,11 +242,10 @@ proc asyncSingleProc(prc: NimNode): NimNode {.compileTime.} =
                   newLit(prcName))
         )
       )
-
-      # -> resultFuture.closure = iterator
+      # -> resultFuture.internalClosure = iterator
       outerProcBody.add(
         newAssignment(
-          newDotExpr(retFutureSym, newIdentNode("closure")),
+          newDotExpr(retFutureSym, newIdentNode("internalClosure")),
           iteratorNameSym)
       )
 
@@ -255,68 +266,44 @@ proc asyncSingleProc(prc: NimNode): NimNode {.compileTime.} =
   # https://github.com/nim-lang/RFCs/issues/435
   prc.addPragma(newIdentNode("gcsafe"))
 
-  let raises = nnkBracket.newTree()
-  when (NimMajor, NimMinor) < (1, 4):
-    raises.add(newIdentNode("Defect"))
   prc.addPragma(nnkExprColonExpr.newTree(
     newIdentNode("raises"),
-    raises
+    nnkBracket.newTree()
   ))
 
   if baseTypeIsVoid:
-    # Add discardable pragma.
     if returnType.kind == nnkEmpty:
       # Add Future[void]
-      prc.params2[0] =
-        newNimNode(nnkBracketExpr, prc)
-        .add(newIdentNode("Future"))
-        .add(newIdentNode("void"))
+      prc.params2[0] = futureVoidType
 
   prc
 
 template await*[T](f: Future[T]): untyped =
   when declared(chronosInternalRetFuture):
-    #work around https://github.com/nim-lang/Nim/issues/19193
-    when not declaredInScope(chronosInternalTmpFuture):
-      var chronosInternalTmpFuture {.inject.}: FutureBase = f
-    else:
-      chronosInternalTmpFuture = f
-    chronosInternalRetFuture.child = chronosInternalTmpFuture
+    chronosInternalRetFuture.internalChild = f
+    # `futureContinue` calls the iterator generated by the `async`
+    # transformation - `yield` gives control back to `futureContinue` which is
+    # responsible for resuming execution once the yielded future is finished
+    yield chronosInternalRetFuture.internalChild
 
-    # This "yield" is meant for a closure iterator in the caller.
-    yield chronosInternalTmpFuture
-
-    # By the time we get control back here, we're guaranteed that the Future we
-    # just yielded has been completed (success, failure or cancellation),
-    # through a very complicated mechanism in which the caller proc (a regular
-    # closure) adds itself as a callback to chronosInternalTmpFuture.
-    #
-    # Callbacks are called only after completion and a copy of the closure
-    # iterator that calls this template is still in that callback's closure
-    # environment. That's where control actually gets back to us.
-
-    chronosInternalRetFuture.child = nil
-    if chronosInternalRetFuture.mustCancel:
+    # `child` is guaranteed to have been `finished` after the yield
+    if chronosInternalRetFuture.internalMustCancel:
       raise newCancelledError()
-    chronosInternalTmpFuture.internalCheckComplete()
+
+    # `child` released by `futureContinue`
+    chronosInternalRetFuture.internalChild.internalCheckComplete()
     when T isnot void:
-      cast[type(f)](chronosInternalTmpFuture).internalRead()
+      cast[type(f)](chronosInternalRetFuture.internalChild).internalRead()
   else:
     unsupported "await is only available within {.async.}"
 
 template awaitne*[T](f: Future[T]): Future[T] =
   when declared(chronosInternalRetFuture):
-    #work around https://github.com/nim-lang/Nim/issues/19193
-    when not declaredInScope(chronosInternalTmpFuture):
-      var chronosInternalTmpFuture {.inject.}: FutureBase = f
-    else:
-      chronosInternalTmpFuture = f
-    chronosInternalRetFuture.child = chronosInternalTmpFuture
-    yield chronosInternalTmpFuture
-    chronosInternalRetFuture.child = nil
-    if chronosInternalRetFuture.mustCancel:
+    chronosInternalRetFuture.internalChild = f
+    yield chronosInternalRetFuture.internalChild
+    if chronosInternalRetFuture.internalMustCancel:
       raise newCancelledError()
-    cast[type(f)](chronosInternalTmpFuture)
+    cast[type(f)](chronosInternalRetFuture.internalChild)
   else:
     unsupported "awaitne is only available within {.async.}"
 

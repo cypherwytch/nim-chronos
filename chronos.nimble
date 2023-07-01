@@ -1,7 +1,7 @@
 mode = ScriptMode.Verbose
 
 packageName   = "chronos"
-version       = "3.1.0"
+version       = "3.2.0"
 author        = "Status Research & Development GmbH"
 description   = "Networking framework with async/await support"
 license       = "MIT or Apache License 2.0"
@@ -36,8 +36,10 @@ task test, "Run all tests":
       "-d:debug -d:chronosPreviewV4",
       "-d:debug -d:chronosDebug -d:useSysAssert -d:useGcAssert",
       "-d:release",
-      "-d:release -d:chronosPreviewV4",
-    ]: run args, "tests/testall"
+      "-d:release -d:chronosPreviewV4"]:
+    run args, "tests/testall"
+    if (NimMajor, NimMinor) > (1, 6):
+      run args & " --mm:refc", "tests/testall"
 
 task test_libbacktrace, "test with libbacktrace":
   var allArgs = @[
